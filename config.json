@@ -1,0 +1,9 @@
+{
+  "server": {
+    "your server id": {
+      "data_path": "your dataset's path",
+      "moel_path": "the save path of your model",
+      "result_path": "the save path of your result"
+    }
+  }
+}
