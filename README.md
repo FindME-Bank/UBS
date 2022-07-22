@@ -16,7 +16,7 @@ This repository contains an implementation of our "Beyond Detection: When, How a
 
 ### data
 
-We provide one dataset, paysim ([data download link](https://drive.google.com/drive/folders/1mY8ZNdK5OALRaBtNjL2HpRGOJSFp-yf_?usp=sharing)).
+We provide paysim demo dataset
 
 `data_ubs.pt` is the data for user behavior sequence.
 
@@ -33,7 +33,7 @@ We provide one dataset, paysim ([data download link](https://drive.google.com/dr
 ```json
 {
   "server": {
-    "33": {
+    "your server name": {
       "data_path": "your dataset's path",
       "model_path": "the model's save path",
       "result_path": "the result's save path"

@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchdiffeq import odeint_adjoint as odeint
 
 from model.base_model.basic_net import MLP
 from model.base_model.cnf import build_cnf
@@ -22,52 +23,62 @@ def quad_func(t, c, w):
 
 
 class UBS(FraudContainer):
-    def __init__(self, type_num, query_feature_dim, support_feature_dim, hidden_dim, event_embed_dim,
-                 flow_layer_num=3, flow_layer_type="ignore", flow_nonlinearity="softplus", time_length=1.0,  # flow
-                 time_normalize=10000, ode_layer_num=2, ode_layer_type="ignore", ode_nonlinearity="sigmoid",  # ode
-                 sample_num=100,  # tpp
-                 max_seq_len=60, beta=-1,  # metric
-                 etm=True, tpm=True, hdt=True, # ablation
-                 lr=1e-3, weight_decay=0, comment="-", **kwargs):
+    def __init__(self, type_num, query_feature_dim, support_feature_dim,  # input
+                 type_embed_dim=32, cnf_hidden_dim=32, flow_layer_num=3, flow_layer_type="ignore",
+                 flow_nonlinearity="softplus", time_length=1.0,  # etm
+                 influence_embed_dim=32, time_normalize=10000, ode_layer_num=2, ode_layer_type="ignore",
+                 ode_nonlinearity="sigmoid",  # ode-rnn
+                 query_embedding_dim=32,
+                 predictor_hidden_dim=32,  # predictor
+                 sample_num=100,  # tpm
+                 max_seq_len=60, beta=-1, distance_hidden_dim=32,  # hdt
+                 etm=True, tpm=True, hdt=True,  # ablation
+                 lr=1e-3, weight_decay=0, comment="-",
+                 **kwargs):
         """
         Args:
+            type_num: number of event type
+            query_feature_dim: feature dimension of the query loan event
+            support_feature_dim: feature dimension of the support event
             %
-            type_num: 事件类型数量
-            support_feature_dim: 事件特征维度
-            hidden_dim: 隐空间维度（encoder编码后的维度）
-            event_embed_dim: 事件embedding维度（同类型事件通过cnf学习到的embedding）
+            type_embed_dim: embedding dimension of event type
+            cnf_hidden_dim: hidden dimension of continuous normalizing flow
+            flow_layer_num: layer number of continuous normalizing flow, in which the last layer dimension equals type_embed_dim
+            flow_layer_type: layer type of of continuous normalizing flow
+            flow_nonlinearity: activation function of odenet in continuous normalizing
             %
-            flow_layer_num: flow的odenet的层数，默认最后一层的维度是event_embed_dim，前面n-1层的维度是hidden_dim
-            flow_layer_type: flow的odenet的类型
-            flow_nonlinearity: flow的odenet的激活函数
-            time_length: cnf积分的最大的时间长度
+            distance_hidden_dim: hidden dimension of the distance network in metric learning
+            predictor_hidden_dim: hidden dimension of default prediction network
             %
-            ode_layer_num: odenet中网络的层数
-            ode_layer_type: odenet中每层网络的类型
-            ode_nonlinearity: odenet中每层网络后的激活函数
+            influence_embed_dim:  embedding dimension of historical cumulative influence
+            ode_layer_num: layer number of the ode network for calculating cumulative influence
+            ode_layer_type: layer type of each ode layer for calculating cumulative influence
+            ode_nonlinearity: activation function of the ode network for calculating cumulative influence
             %
-            sample_num: tpp计算积分的MCMC
+            sample_num: MCMC integral sample number in time prediciton model
             %
-            max_seq_len: 自适应beta的计算参数
-            beta: metric learning中作为参数, default:-1 means adaptive
+            max_seq_len: maximum historical sequence length for adaptive margin calculation in metric learning
+            beta: margin in metric learning. Default: -1 refer to adaptive margin calculation
             %
-            etm: 是否需要event type module, default True
-            tpm: 是否需要time predict module, default True
-            hdt: 是否需要hard discriminated module, default True
+            etm: boolean indicator for ablation study UBS-w/o-ETM, default True
+            tpm: boolean indicator for ablation study UBS-w/o-TPM, default True
+            hdt: boolean indicator for ablation study UBS-w/o-HDT, default True
             %
-            lr: 学习率
-            weight_decay: 衰减率
+            lr: learning rate
+            weight_decay: decay rate
         """
         super(UBS, self).__init__(lr=lr, weight_decay=weight_decay, comment=comment)
         self.beta = beta
         self.type_num = type_num
         self.query_feature_dim = query_feature_dim
         self.support_feature_dim = support_feature_dim
-        self.hidden_dim = hidden_dim
-        self.event_embed_dim = event_embed_dim
+        self.type_embed_dim = type_embed_dim
         self.time_normalize = time_normalize
         self.sample_num = sample_num
         self.max_seq_len = max_seq_len
+        self.influence_embed_dim = influence_embed_dim
+        self.predictor_hidden_dim = predictor_hidden_dim
+        self.distance_hidden_dim = distance_hidden_dim
 
         # ablation
         self.etm = etm
@@ -75,43 +86,46 @@ class UBS(FraudContainer):
         self.hdt = hdt
 
         # event_type_distribution_model
-        self.encoders = nn.ModuleList([IreregularCNN(in_dim=support_feature_dim, pool_dim=30, hidden_dim=event_embed_dim)
+        self.encoders = nn.ModuleList([IreregularCNN(in_dim=support_feature_dim, pool_dim=30, hidden_dim=type_embed_dim)
                                        for _ in range(type_num)])
-        self.mean_linears = nn.ModuleList([nn.Linear(event_embed_dim, event_embed_dim) for _ in range(type_num)])
-        self.std_linears = nn.ModuleList([nn.Linear(event_embed_dim, event_embed_dim) for _ in range(type_num)])
-        self.cnfs = nn.ModuleList([build_cnf(input_dim=event_embed_dim, layer_type=flow_layer_type,
-                                             hidden_dims=[hidden_dim] * (flow_layer_num - 1) + [event_embed_dim],
+        self.mean_linears = nn.ModuleList([nn.Linear(type_embed_dim, type_embed_dim) for _ in range(type_num)])
+        self.std_linears = nn.ModuleList([nn.Linear(type_embed_dim, type_embed_dim) for _ in range(type_num)])
+        self.cnfs = nn.ModuleList([build_cnf(input_dim=type_embed_dim, layer_type=flow_layer_type,
+                                             hidden_dims=[cnf_hidden_dim] * (flow_layer_num - 1) + [type_embed_dim],
                                              nonlinearity=flow_nonlinearity, time_length=time_length)
                                    for _ in range(type_num)])
 
         # event_type_attention
         self.type_atten_linear = nn.ModuleList(
-            [nn.Linear(2 * event_embed_dim, event_embed_dim) for _ in range(type_num)])
+            [nn.Linear(2 * type_embed_dim, type_embed_dim) for _ in range(type_num)])
 
         # cumulated_historical_influence_module
         if self.etm:
-            self.rnn = nn.LSTM(1 + support_feature_dim + event_embed_dim, hidden_dim)
+            self.rnn = nn.GRUCell(1 + support_feature_dim + type_embed_dim, influence_embed_dim)
         else:
-            self.rnn = nn.LSTM(1 + support_feature_dim, hidden_dim)
-        self.ode_func = ODEnet(in_dim=hidden_dim, hidden_dims=[hidden_dim] * ode_layer_num, out_dim=hidden_dim,
-                               layer_type=ode_layer_type, nonlinearity=ode_nonlinearity)
+            self.rnn = nn.GRUCell(1 + support_feature_dim, influence_embed_dim)
+        self.ode_func = ODEnet(in_dim=influence_embed_dim, hidden_dims=[influence_embed_dim] * ode_layer_num,
+                               out_dim=influence_embed_dim, layer_type=ode_layer_type, nonlinearity=ode_nonlinearity)
 
         # time_prediction_module
-        self.v = nn.Parameter(torch.rand(hidden_dim, 1))
+        self.v = nn.Parameter(torch.rand(influence_embed_dim, 1))
         self.w = nn.Parameter(torch.rand(1))  # beta
         self.b = nn.Parameter(torch.rand(1))  # base_intensity, lambda_0
 
+        # query_embedding_module
+        self.query_embedding_net = MLP(query_feature_dim, [query_embedding_dim])
+
         # default_event_prediction_module
-        if self.tpm:
-            self.predictor = MLP(hidden_dim + query_feature_dim + 1, [hidden_dim, 1], activation="relu", last_activation=None)
-        else:
-            self.predictor = MLP(hidden_dim + query_feature_dim, [hidden_dim, 1], activation="relu", last_activation=None)
-        self.distance = MLP(2 * (hidden_dim + query_feature_dim), [hidden_dim, 1], activation="relu",
+        self.predictor = MLP(influence_embed_dim + influence_embed_dim + 1, [predictor_hidden_dim, 1], activation="relu", last_activation=None)
+
+        self.distance = MLP(2 * (influence_embed_dim + influence_embed_dim + 1), [distance_hidden_dim, 1], activation="relu",
                             last_activation=None)
+
         self.first_validation = True
+        self.is_weighted_loss = True
 
     def forward(self, batch_size, query_emb, support_emb_after_group, support_type_after_group, behavior_seq_emb,
-        behavior_seq_type, behavior_seq_time, behavior_seq_len, query_time, settle_time, is_test, gt=None):
+                behavior_seq_type, behavior_seq_time, behavior_seq_len, query_time, settle_time, is_test, gt=None):
         """
         Variable:
             batch_size: int
@@ -128,42 +142,45 @@ class UBS(FraudContainer):
         """
         if self.etm:
             event_type_distribution, mus, logvars, delta_logps = self.model_event_type_distribution(
-                support_emb_after_group, support_type_after_group)  # [batch_size][type_num, event_embed_dim]
+                support_emb_after_group, support_type_after_group)  # [batch_size][type_num, type_embed_dim]
             event_type_representations = self.event_type_attention(event_type_distribution, support_type_after_group,
-                                                                   batch_size)  # [batch_size][type_num, event_embed_dim]
+                                                                   batch_size)  # [batch_size][type_num, type_embed_dim]
         else:
             mus, logvars, delta_logps, event_type_representations = None, None, None, None
         behavior_seq_representations = self.get_behavior_seq_representations(batch_size, behavior_seq_emb,
                                                                              behavior_seq_type, behavior_seq_time,
                                                                              event_type_representations)
         cumulated_influence, h = self.model_cumulated_influence(batch_size, behavior_seq_representations,
-                                                                behavior_seq_time, behavior_seq_len, query_time)
-        repayment_willingness, loglike_tp = self.predict_time(cumulated_influence, query_time, settle_time, is_test)
-        default_prob = self.predict_default(cumulated_influence, repayment_willingness, query_emb)
+                                                             behavior_seq_time, behavior_seq_len, query_time)
+        f, loglike_tp = self.predict_time(h, query_time, settle_time, is_test)
+
+        query_emb = self.query_embedding_net(query_emb)
+        default_prob = self.predict_default(query_emb, h, f)
 
         if is_test:
             return default_prob
         else:
-            distance = self.calculate_distance(cumulated_influence, query_emb)
-            metric_pairs, beta = self.hard_discriminated_sample(distance, behavior_seq_len, gt)
+            if self.hdt:
+                distance = self.calculate_distance(query_emb, h, f)
+                metric_pairs, beta = self.hard_discriminated_sample(distance, behavior_seq_len, gt)
+            else:
+                metric_pairs, distance, beta = None, None, None
             return default_prob, mus, logvars, delta_logps, loglike_tp, \
-                   metric_pairs, distance, beta, default_prob
+                   metric_pairs, distance, beta
 
-
-    def calculate_distance(self, cumulated_influence, query_emb):
-        h = torch.cat([cumulated_influence, query_emb], dim=-1)
+    def calculate_distance(self, query_emb, h, f):
+        h = torch.cat([query_emb, h, f.unsqueeze(-1)], dim=-1)
         input = torch.cat([h.repeat_interleave(h.shape[0], dim=0), h.repeat((h.shape[0], 1))], dim=-1)  # [b*b,2*h]
         distance = self.distance(input).squeeze(-1).reshape(h.shape[0], h.shape[0])
         distance = torch.sigmoid(distance)
         return distance
 
-    def predict_default(self, h, lambda_, query_emb):
+    def predict_default(self, query_emb, h, f):
         if self.tpm:
-            lambda_ = lambda_.unsqueeze(-1)
-            h = torch.cat([query_emb, h, lambda_], dim=-1)
+            h = torch.cat([query_emb, h, f.unsqueeze(-1)], dim=-1)
             default_prob = self.predictor(h).squeeze(-1)
         else:
-            h = torch.cat([h, query_emb], dim=-1)
+            h = torch.cat([query_emb, h], dim=-1)
             default_prob = self.predictor(h).squeeze(-1)
         return torch.sigmoid(default_prob)
 
@@ -179,20 +196,20 @@ class UBS(FraudContainer):
         beta = - F.softplus(self.w)
 
         repayment_willingness = torch.zeros(h.shape[0]).to(self.device)
-        log_f = torch.zeros(h.shape[0]).to(self.device)
+        f = torch.zeros(h.shape[0]).to(self.device)
 
         samples_t = [torch.randint(query_time[i] + 1, settle_time[i] + 1, [self.sample_num]) for i in range(h.shape[0])]
         samples_t = torch.stack(samples_t, dim=0).to(self.device)  # [b,sample_num]
 
         for i in range(self.sample_num):
             delta_t = samples_t[:, i] - query_time
+
             log_lambda_ = h + beta * delta_t + self.b
             lambda_ = torch.exp(torch.min(log_lambda_, torch.ones_like(h) * 2.))
-            log_f += log_lambda_ - (1.0 / beta) * torch.exp(
-                torch.min(torch.ones_like(h) * 10., h + self.b) + lambda_ / beta)
+            f += lambda_ / torch.exp((1.0 / beta) * torch.exp(
+                torch.min(torch.ones_like(h) * 10., h + self.b) + lambda_ / beta))
             repayment_willingness += lambda_
-
-        return repayment_willingness, log_f
+        return repayment_willingness, f
 
     def quad_worker(self, h, query_time):
         """
@@ -215,7 +232,7 @@ class UBS(FraudContainer):
         """
         Args:
             batch_size: int
-            behavior_seq: list of tensor, [batch_size][historical_behavior_num，event_embed_dim]
+            behavior_seq: list of tensor, [batch_size][historical_behavior_num，type_embed_dim]
             behavior_seq_time: list of tensor, [batch_size][historical_behavior_num]
             behavior_seq_len: list, [batch_size]
             query_time: tensor, [batch_size]
@@ -230,58 +247,63 @@ class UBS(FraudContainer):
             aligned_behavior_seq[i, behavior_seq_len[i]:] = seq[-1]
 
         # 2. 计算behavior_seq期间的cumulated_influence
-        rnn_h, _ = self.rnn(aligned_behavior_seq)
-        # rnn_h = torch.zeros(batch_size, max_seq_len, self.hidden_dim).to(self.device)
-        # ode_h = torch.zeros(batch_size, max_seq_len, self.hidden_dim).to(self.device)
-        # for s in range(max_seq_len):
-        #     if s == 0:
-        #         rnn_h[:, s] = self.rnn(aligned_behavior_seq[:, s])   # [batch_size, hidden_dim]
-        #     else:
-        #         rnn_h[:, s] = self.rnn(aligned_behavior_seq[:, s], ode_h[:,s-1])  # [batch_size, hidden_dim]
+        rnn_h = torch.zeros(batch_size, max_seq_len, self.influence_embed_dim).to(self.device)
+        ode_h = torch.zeros(batch_size, max_seq_len, self.influence_embed_dim).to(self.device)
+        for s in range(max_seq_len):
+            if s == 0:
+                rnn_h[:, s] = self.rnn(aligned_behavior_seq[:, s])  # [batch_size, hidden_dim]
+            else:
+                rnn_h[:, s] = self.rnn(aligned_behavior_seq[:, s], rnn_h[:, s-1].data)  # [batch_size, hidden_dim]
 
-        # if s != max_seq_len - 1:
-        #     target_time = aligned_behavior_seq_time[:, s+1].tolist()
-        #     unique_target_time = list(set([0.] + target_time))
-        #     unique_target_time.sort()
-        #     unique_target_time = torch.tensor(unique_target_time).to(self.device)
+            if s != max_seq_len - 1:
+                target_time = aligned_behavior_seq[:, s, 0] / self.time_normalize
+                unique_target_time = torch.cat([torch.tensor([0.]).to(self.device), target_time],
+                                               dim=0).unique().sort().values
+                ode_out = odeint(func=self.ode_func, y0=rnn_h[:, s], t=unique_target_time,
+                                 adjoint_options={"norm": "seminorm"})
 
-        # ode_out = odeint(func=self.ode_func, y0=rnn_h[:,s], t=unique_target_time, adjoint_options={"norm": "seminorm"})
-        # ode_out = ode_out.permute(1,0,2).to(self.device)
-        # unique_target_time = unique_target_time.tolist()
-        # for b in range(len(target_time)):
-        #     index = unique_target_time.index(target_time[b])
-        #     ode_h[b,s] = ode_out[b, index]
+                target_time = target_time.detach().cpu().numpy()
+                unique_target_time = unique_target_time.detach().cpu().numpy()
+                time_idx = torch.tensor((unique_target_time[:, None] == target_time).argmax(axis=0)).to(self.device)
+                time_idx = time_idx.unsqueeze(0).unsqueeze(-1).expand(1, batch_size, self.influence_embed_dim)
+                ode_h[:, s] = ode_out.gather(0, time_idx).squeeze(0)  # [b,h]
 
         # 3. 计算最后一个事件到query发生的的cumulated_influence
-        h = rnn_h.gather(1, torch.tensor(behavior_seq_len).unsqueeze(-1).unsqueeze(-1).expand(batch_size, 1, self.hidden_dim).to(self.device) - 1).squeeze(1)
+        select_index = torch.tensor(behavior_seq_len).unsqueeze(-1).\
+            unsqueeze(-1).expand(batch_size, 1, self.influence_embed_dim).to( self.device)
+        h = rnn_h.gather(1,  select_index-1).squeeze(1)
+        last_event_time = torch.cat([x[-1:] for x in behavior_seq_time], dim=0) / self.time_normalize
+        query_time = query_time / self.time_normalize
+        delta_time = query_time - last_event_time
+        unique_delta_time = torch.cat([torch.tensor([0.]).to(self.device), delta_time],
+                                      dim=0).unique().sort().values
 
-        # last_event_time = torch.cat([x[-1:] for x in behavior_seq_time], dim=0) / self.time_normalize
-        # query_time = query_time / self.time_normalize
-        # delta_time = query_time - last_event_time
-        # unique_delta_time = torch.cat([torch.tensor([0.]).to(self.device), delta_time], dim=0).unique().sort().values
-        #
-        # ode_out = odeint(func=self.ode_func, y0=h, t=unique_delta_time, adjoint_options={"norm": "seminorm"})  # [t,b,h]
-        #
-        # delta_time = delta_time.cpu().numpy()
-        # unique_delta_time = unique_delta_time.cpu().numpy()
-        # time_idx = torch.tensor((unique_delta_time[:, None] == delta_time).argmax(axis=0)).to(self.device)
-        # time_idx = time_idx.unsqueeze(0).unsqueeze(-1).expand(1, batch_size, self.hidden_dim)
-        # cumulated_influence = ode_out.gather(0, time_idx).squeeze(0)  # [b,h]
+        ode_out = odeint(func=self.ode_func, y0=h, t=unique_delta_time,
+                         adjoint_options={"norm": "seminorm"})  # [t,b,h]
 
-        return h, h
+        delta_time = delta_time.cpu().numpy()
+        unique_delta_time = unique_delta_time.cpu().numpy()
+        time_idx = torch.tensor((unique_delta_time[:, None] == delta_time).argmax(axis=0)).to(self.device)
+        time_idx = time_idx.unsqueeze(0).unsqueeze(-1).expand(1, batch_size, self.influence_embed_dim)
+        cumulated_influence = ode_out.gather(0, time_idx).squeeze(0)  # [b,h]
+
+        return cumulated_influence, h
 
     def get_behavior_seq_representations(self, batch_size, behavior_seq_emb, behavior_seq_type, behavior_seq_time,
                                          event_type_representations):
         behavior_seq_representations = []
         for i in range(batch_size):
-            time_representation = behavior_seq_time[i].unsqueeze(-1)
+            time_representation = behavior_seq_time[i][1:] - behavior_seq_time[i][:-1]
+            time_representation = torch.cat([torch.zeros([1]).to(time_representation.device), time_representation])
+            time_representation = time_representation.unsqueeze(-1)
+
             if event_type_representations is not None:
                 type_representation = event_type_representations[i][behavior_seq_type[i]]
                 representation = torch.cat([time_representation, behavior_seq_emb[i], type_representation], dim=-1)
             else:
                 representation = torch.cat([time_representation, behavior_seq_emb[i]], dim=-1)
             behavior_seq_representations.append(representation)
-        return behavior_seq_representations  # [batch_size][historical_behavior_num，1+support_feature_dim+event_embed_dim]
+        return behavior_seq_representations  # [batch_size][historical_behavior_num，1+support_feature_dim+type_embed_dim]
 
     def event_type_attention(self, event_type_distribution, support_type_after_group, batch_size):
         """
@@ -291,15 +313,17 @@ class UBS(FraudContainer):
         Returns:
             behavior_seq_representations: list of tensor, [batch_size][type_num, hidden_dim]
         """
-        behavior_seq_representations = torch.zeros([batch_size, self.type_num, self.event_embed_dim]).to(self.device)
+        behavior_seq_representations = torch.zeros([batch_size, self.type_num, self.type_embed_dim]).to(self.device)
         for i in range(batch_size):
             distributions, types = event_type_distribution[i], support_type_after_group[i]
             l = len(types)
-            concat_distributions = torch.cat([distributions.repeat_interleave(l, dim=0), distributions.repeat((l, 1))], dim=-1)
+            concat_distributions = torch.cat([distributions.repeat_interleave(l, dim=0), distributions.repeat((l, 1))],
+                                             dim=-1)
             concat_distributions = concat_distributions.chunk(l, 0)
 
             for j, t in enumerate(types):
-                unnorm_weights = torch.tanh(self.type_atten_linear[t](concat_distributions[j])) # [type_num, hidden_dim * 2] -> [type_num, hidden_dim]
+                unnorm_weights = torch.tanh(self.type_atten_linear[t](
+                    concat_distributions[j]))  # [type_num, hidden_dim * 2] -> [type_num, hidden_dim]
                 weights = torch.softmax(unnorm_weights, dim=0)  # [type_num, hidden_dim]
                 behavior_seq_representations[i][j] = torch.sum(weights * distributions, dim=0)
         return behavior_seq_representations
@@ -310,10 +334,10 @@ class UBS(FraudContainer):
             support_emb_after_group: list of tensor, [batch_size * type_num][event_num, dims]
             support_type_after_group: list of tensor, [batch_size][type_num]
         Returns:
-            event_type_distribution: list of tensor, [batch_size][type_num, event_embed_dim]
+            event_type_distribution: list of tensor, [batch_size][type_num, type_embed_dim]
         """
         all_type = torch.cat(support_type_after_group, dim=0)
-        event_type_distribution = torch.zeros([len(all_type), self.event_embed_dim]).to(all_type.device)
+        event_type_distribution = torch.zeros([len(all_type), self.type_embed_dim]).to(all_type.device)
 
         mus = []
         logvars = []
@@ -355,7 +379,6 @@ class UBS(FraudContainer):
         z = mu + eps
         return z
 
-
     def hard_discriminated_sample(self, distance, seq_len, gt):
         positive_points = (gt == 1).nonzero().squeeze(-1)
         negetive_points = (gt == 0).nonzero().squeeze(-1)
@@ -390,38 +413,38 @@ class UBS(FraudContainer):
             if J_overline != 0:
                 J_overline = J_overline.log()
             J_overline = J_overline + distance[i, j]
-            J += max(0, J_overline)
-        J = J / (2 * len(metric_pairs))
+            J += max(0, J_overline.pow(2))
+        J = J / len(metric_pairs)
         return J
 
-    def calculate_loss(self, mus, logvars, delta_logps, loglike_tp, metric_pairs, distance, beta, default_prob, gt):
-        bactch_size = len(gt)
-        # 1. Attentive Time-Aware Embedding Module
-        # if self.etm:
-        #     loss_atae = torch.sum((- 0.5 * (1 + logvars - mus.pow(2) - logvars.exp()).sum(-1)) + delta_logps) / bactch_size
-        #     weighted_loss_atae = loss_atae / math.pow(10, math.floor(math.log10(abs(loss_atae.item())+1e-9)))
-        # else:
-        #     weighted_loss_atae = 0
-        #
-        # # 2. Time Prediction Module
-        # if self.tpm:
-        #     loss_tp = torch.mean(- (1 - gt) * loglike_tp + gt * loglike_tp)
-        #     weighted_loss_tp = loss_tp / math.pow(10, math.floor(math.log10(abs(loss_tp.item())+1e-9)))
-        # else:
-        #     weighted_loss_tp = 0
+    @staticmethod
+    def weighted_loss(loss):
+        if loss > 10:
+            return loss / math.pow(10, math.floor(math.log10(abs(loss.item()) + 1e-9)))
+        else:
+            return loss
 
-        # 3. Event Default Prediction Module
-        # weight = torch.where(gt > 0, torch.ones_like(gt) * 0.95, torch.ones_like(gt) * 0.05)
-        # bce = F.binary_cross_entropy(default_prob, gt.to(default_prob.dtype), weight=weight)
+    def calculate_loss(self, mus, logvars, delta_logps, like_tp, metric_pairs, distance, beta, default_prob, gt, query_time, settle_time):
+        # 基础MLP的loss
         bce = F.binary_cross_entropy(default_prob, gt.to(default_prob.dtype))
+        bactch_size = len(gt)
+
+        loss = bce
+        if self.etm:
+            loss_atae = torch.sum(
+                (- 0.5 * (1 + logvars - mus.pow(2) - logvars.exp()).sum(-1)) + delta_logps) / bactch_size
+            loss = loss + self.weighted_loss(loss_atae) if self.is_weighted_loss else loss + loss_atae
+
+        if self.tpm:
+            loss_tp = torch.mean(- (1 - gt) * torch.log(like_tp) - gt * torch.log(
+                torch.max(settle_time - query_time - like_tp, torch.ones_like(gt) * 1e-9)))
+            loss = loss + self.weighted_loss(loss_tp) if self.is_weighted_loss else loss + loss_tp
+
         if self.hdt:
             J = self.calculate_hard_discriminated_loss(metric_pairs, distance, beta)
-            loss_dep = bce + J
-        else:
-            loss_dep = bce
-        weighted_loss_dep = loss_dep / math.pow(10, math.floor(math.log10(abs(loss_dep.item())+1e-9)))
+            loss = loss + self.weighted_loss(J) if self.is_weighted_loss else loss + J
 
-        return loss_dep
+        return loss
 
     def formulate_for_metric(self, p_prob):
         p = ((p_prob >= 0.5) * 1).to(torch.int)
@@ -435,12 +458,13 @@ class UBS(FraudContainer):
         behavior_seq_type, behavior_seq_time, behavior_seq_len, query_time, settle_time, gt = \
             self.data_prepare(data, is_test=False)
 
-        default_prob, mus, logvars, delta_logps, loglike_tp,  metric_pairs, distance, beta, default_prob = \
+        default_prob, mus, logvars, delta_logps, like_tp, metric_pairs, distance, beta = \
             self.forward(batch_size, query_emb, support_emb_after_group, support_type_after_group, behavior_seq_emb,
                          behavior_seq_type, behavior_seq_time, behavior_seq_len, query_time, settle_time,
                          is_test=False, gt=gt)
 
-        loss = self.calculate_loss(mus, logvars, delta_logps, loglike_tp, metric_pairs, distance, beta, default_prob, gt)
+        loss = self.calculate_loss(mus, logvars, delta_logps, like_tp, metric_pairs, distance, beta, default_prob,
+                                   gt, query_time, settle_time)
         self.log('train_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=len(gt))
         return loss
 
@@ -472,7 +496,6 @@ class UBS(FraudContainer):
                                     query_time, settle_time, is_test=True)
         p = self.formulate_for_metric(default_prob)
         self.update_metric("test", gt, p, p_prob=default_prob)
-
 
     def data_merge(self, data):
         data, data_fraud = data.values()
@@ -512,14 +535,16 @@ class UBS(FraudContainer):
         """
         # get data
         query_emb, query_time = data[0]['target_event_embedding'], data[0]['target_event_time']
-        behavior_seq_emb, behavior_seq_type, behavior_seq_time = data[0]['historical_behavior_embedding'], data[0][
-            'historical_behavior_type'], data[0]['historical_behavior_time']
+        behavior_seq_emb, behavior_seq_type, behavior_seq_time = data[0]['historical_behavior_embedding'], \
+                                                                 data[0]['historical_behavior_type'], \
+                                                                 data[0]['historical_behavior_time']
+
         gt, gt_time = data[1]["target_event_fraud"], data[1]["target_event_settle_time"]
         behavior_seq_len = [len(x) for x in behavior_seq_emb]
         batch_size = len(gt)
 
         # 分type获取数据
-        support_emb_after_group = []   # [batch_size * type][event_num, dims]
+        support_emb_after_group = []  # [batch_size * type][event_num, dims]
         support_type_after_group = []  # [batch_size][type]
         for i, emb in enumerate(behavior_seq_emb):
             support_type_after_group.append(behavior_seq_type[i].unique())
@@ -533,6 +558,7 @@ class UBS(FraudContainer):
         else:
             settle_time = copy.deepcopy(gt_time)
             settle_time[gt == 1] = settle_time[gt == 1] + 60
+
         return batch_size, query_emb, support_emb_after_group, support_type_after_group, behavior_seq_emb, \
                behavior_seq_type, behavior_seq_time, behavior_seq_len, query_time, settle_time, gt
 

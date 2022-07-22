@@ -12,48 +12,51 @@ from model.ubs import UBS
 
 
 class UBSR(UBS):
-    def __init__(self, type_num, query_feature_dim, support_feature_dim, hidden_dim, event_embed_dim,
-                 time_dim, position_dim, walk_emb_dim, walk_length, graph_layers=2,
-                 flow_layer_num=3, flow_layer_type="ignore", flow_nonlinearity="softplus", time_length=1.0,  # flow
-                 time_normalize=10000, ode_layer_num=2, ode_layer_type="ignore", ode_nonlinearity="sigmoid",  # ode
-                 sample_num=100,  # tpp
-                 max_seq_len=60, # metric
-                 lr=1e-3, weight_decay=0, comment="-", **kwargs):
+    def __init__(self, type_num, query_feature_dim, support_feature_dim, walk_length, walk_emb_dim,  # input
+                 time_encoder_dim=1, risk_embed_dim=32, conduction_hidden_dim=32, match_hidden_dim=32, graph_layers=2,
+                 **kwargs):
+        '''
+        Args:
+            walk_length: path length of the time-aware risk conduction paths extraction layer
+            walk_emb_dim: the input walk embedding dimension in the risk conduction embedding layer
+            time_encoder_dim: time encoder dimension for walk embedding
+            conduction_hidden_dim: hidden dimension of the risk conduction embedding layer
+            match_hidden_dim: hidden dimension of the graph affinity matrix
+            graph_layers: number of the cross graph risk diffusion layer
+            query_embedding_dim: dimension of query embedding
+            risk_embed_dim: risk embedding dimension for default prediction
+            **kwargs:
+        '''
         super(UBSR, self).__init__(type_num=type_num, query_feature_dim=query_feature_dim,
-                                   support_feature_dim=support_feature_dim, hidden_dim=hidden_dim,
-                                   event_embed_dim=event_embed_dim, time_normalize=time_normalize,
-                                   flow_layer_num=flow_layer_num, flow_layer_type=flow_layer_type,
-                                   flow_nonlinearity=flow_nonlinearity, time_length=time_length,
-                                   ode_layer_num=ode_layer_num, ode_layer_type=ode_layer_type,
-                                   ode_nonlinearity=ode_nonlinearity, sample_num=sample_num,
-                                   max_seq_len=max_seq_len, beta=-1,
-                                   etm=True, tpm=True, hdt=True,
-                                   lr=lr, weight_decay=weight_decay, comment=comment)
-
-
+                                   support_feature_dim=support_feature_dim, **kwargs)
         # risk_conduction_effect_learning_module
-        self.time_encoder = TimeEncode(expand_dim=time_dim)
-        self.s_position_encoder = nn.Sequential(nn.Linear(walk_length+1, position_dim),
+        self.time_encoder = TimeEncode(expand_dim=time_encoder_dim)
+        self.s_position_encoder = nn.Sequential(nn.Linear(walk_length + 1, conduction_hidden_dim),
                                                 nn.ReLU(),
-                                                nn.Linear(position_dim, position_dim))
-        self.t_position_encoder = nn.Sequential(nn.Linear(walk_length+1, position_dim),
+                                                nn.Linear(conduction_hidden_dim, conduction_hidden_dim))
+        self.t_position_encoder = nn.Sequential(nn.Linear(walk_length + 1, conduction_hidden_dim),
                                                 nn.ReLU(),
-                                                nn.Linear(position_dim, position_dim))
-        self.feature_layer = nn.LSTM(time_dim + position_dim * 2 + walk_emb_dim, hidden_dim, batch_first=True,
+                                                nn.Linear(conduction_hidden_dim, conduction_hidden_dim))
+        self.feature_layer = nn.LSTM(time_encoder_dim + conduction_hidden_dim * 2 + walk_emb_dim, conduction_hidden_dim,
+                                     batch_first=True,
                                      bidirectional=True)
-        self.position_layer = nn.LSTM(position_dim*2, hidden_dim, batch_first=True, bidirectional=True)
-        self.projector = nn.Linear(2*hidden_dim + 2*hidden_dim, hidden_dim)
-        self.risk_layer = nn.Linear(hidden_dim, hidden_dim)
+        self.position_layer = nn.LSTM(conduction_hidden_dim * 2, conduction_hidden_dim, batch_first=True,
+                                      bidirectional=True)
+        self.projector = nn.Linear(2 * conduction_hidden_dim + 2 * conduction_hidden_dim, conduction_hidden_dim)
+        self.risk_layer = nn.Linear(conduction_hidden_dim, risk_embed_dim)
 
         # default_event_prediction_module
-        self.predictor = MLP(hidden_dim + query_feature_dim, [hidden_dim, 1], activation="relu", last_activation=None)
-        self.distance = MLP(2 * (query_feature_dim), [hidden_dim, 1], activation="relu", last_activation=None)
+        self.predictor = MLP(self.influence_embed_dim + self.query_feature_dim + risk_embed_dim,
+                             [self.predictor_hidden_dim, 1], activation="relu", last_activation=None)
+        self.distance = MLP(2 * (self.influence_embed_dim + self.query_feature_dim + risk_embed_dim),
+                            [self.distance_hidden_dim, 1], activation="relu", last_activation=None)
 
         # match_module
-        self.affinity = Affinity(hidden_dim)
+        self.affinity = Affinity(match_hidden_dim)
         self.sinkhorn = Sinkhorn(batched_operation=True)
-        self.sage = GAT(in_dim=hidden_dim, hidden_dims=[hidden_dim] * graph_layers, heads=[8]*graph_layers, activation="relu", last_activation="relu")
-        self.similarity = MLP(2 * hidden_dim, [hidden_dim, 1], activation="relu", last_activation=None)
+        self.sage = GAT(in_dim=match_hidden_dim, hidden_dims=[match_hidden_dim] * graph_layers,
+                        heads=[8] * graph_layers, activation="relu", last_activation="relu")
+        self.similarity = MLP(2 * match_hidden_dim, [match_hidden_dim, 1], activation="relu", last_activation=None)
 
     def forward(self, batch_size, query_emb, support_emb_after_group, support_type_after_group, behavior_seq_emb,
                 behavior_seq_type, behavior_seq_time, behavior_seq_len, query_time, settle_time,
@@ -79,46 +82,48 @@ class UBSR(UBS):
             is_test: bool
             gt: ground_truth. It will not be passed during the test phase.
         """
-        # event_type_distribution, mus, logvars, delta_logps = self.model_event_type_distribution(support_emb_after_group, support_type_after_group)  # [batch_size][type_num, event_embed_dim]
-        # event_type_representations = self.event_type_attention(event_type_distribution, support_type_after_group, batch_size)  # [batch_size][type_num, event_embed_dim]
-        # behavior_seq_representations = self.get_behavior_seq_representations(batch_size, behavior_seq_emb,
-        #                                                                      behavior_seq_type, behavior_seq_time,
-        #                                                                      event_type_representations)
-        # cumulated_influence, _ = self.model_cumulated_influence(batch_size, behavior_seq_representations,
-        #                                                         behavior_seq_time, behavior_seq_len, query_time)
-        # repayment_willingness, loglike_tp = self.predict_time(cumulated_influence, query_time, settle_time, is_test)
-
+        if self.etm:
+            event_type_distribution, mus, logvars, delta_logps = self.model_event_type_distribution(
+                support_emb_after_group, support_type_after_group)  # [batch_size][type_num, type_embed_dim]
+            event_type_representations = self.event_type_attention(event_type_distribution, support_type_after_group,
+                                                                   batch_size)  # [batch_size][type_num, type_embed_dim]
+        else:
+            mus, logvars, delta_logps, event_type_representations = None, None, None, None
+        behavior_seq_representations = self.get_behavior_seq_representations(batch_size, behavior_seq_emb,
+                                                                             behavior_seq_type, behavior_seq_time,
+                                                                             event_type_representations)
+        cumulated_influence = self.model_cumulated_influence(batch_size, behavior_seq_representations,
+                                                             behavior_seq_time, behavior_seq_len, query_time)
+        repayment_willingness, like_tp = self.predict_time(cumulated_influence, query_time, settle_time, is_test)
 
         risk_embedding = self.learning_risk_conduction_effect(caw_s, caw_t, caw_time, caw_edge_emb, caw_mask_len)
 
+        match_pairs = self.get_match_pairs(batch_size=batch_size)
+        target_risk_embedding, walk_distance = self.match(match_pairs, risk_embedding, caw_edge_index)
+        query_emb = self.query_embedding_net(query_emb)
+        default_prob = self.predict_default(cumulated_influence, repayment_willingness, query_emb,
+                                            target_risk_embedding)
+
         if is_test:
-            match_pairs = self.get_match_pairs(batch_size=batch_size)
-            target_risk_embedding, walk_distance = self.match(match_pairs, risk_embedding, caw_edge_index)
-            default_prob = self.predict_default(None, None, query_emb, target_risk_embedding)
             return default_prob
         else:
-            distance = self.calculate_distance(None, query_emb)
+            distance = self.calculate_distance(cumulated_influence, repayment_willingness, query_emb, target_risk_embedding)
             metric_pairs, beta = self.hard_discriminated_sample(distance, behavior_seq_len, gt)
-            match_pairs = self.get_match_pairs(metric_pairs=metric_pairs)
-            target_risk_embedding, walk_distance = self.match(match_pairs, risk_embedding, caw_edge_index)
-            default_prob = self.predict_default(None, None, query_emb, target_risk_embedding)
-            return default_prob, None, None, None, None, metric_pairs, distance + walk_distance, beta
+            return default_prob, mus, logvars, delta_logps, like_tp, \
+                   metric_pairs, distance, beta
 
-    def calculate_distance(self, cumulated_influence, query_emb):
-        # h = torch.cat([cumulated_influence, query_emb], dim=-1)
-        h = query_emb
-        input = torch.cat([h.repeat_interleave(h.shape[0], dim=0), h.repeat((h.shape[0], 1))], dim=-1)  # [b*b,2*h]
+    def calculate_distance(self, h, willingness, query_emb, target_risk_embedding):
+        input = torch.cat([h, query_emb, target_risk_embedding], dim=-1)
+        input = torch.cat([input.repeat_interleave(input.shape[0], dim=0), input.repeat((input.shape[0], 1))],
+                          dim=-1)  # [b*b,2*h]
         distance = self.distance(input).squeeze(-1).reshape(h.shape[0], h.shape[0])
         distance = torch.sigmoid(distance)
         return distance
 
-    def predict_default(self, h, lambda_, query_emb, risk_embedding):
-        # lambda_ = lambda_.unsqueeze(-1)     # [b,1]
-        # input = torch.cat([h, lambda_], dim=-1)     # [b,h+1]
-        h = torch.cat([query_emb, risk_embedding], dim=-1)
-        default_prob = self.predictor(h).squeeze(-1)
-        default_prob = torch.sigmoid(default_prob)
-        return default_prob
+    def predict_default(self, h, willingness, query_emb, target_risk_embedding):
+        input = torch.cat([h, query_emb, target_risk_embedding], dim=-1)
+        default_prob = self.predictor(input).squeeze(-1)
+        return torch.sigmoid(default_prob)
 
     def match(self, match_pairs, risk_embedding, graph_enclosing):
         """
@@ -135,22 +140,21 @@ class UBSR(UBS):
         for b, emb in enumerate(risk_embedding):
             align_risk_embedding[b, :len(emb)] = emb
 
-        x = align_risk_embedding[match_pairs[:, 0]]     # [match_num, max_node_num, emb_dim]
-        x_len = node_num[match_pairs[:, 0]]             # [match_num]
-        y = align_risk_embedding[match_pairs[:, 1]]     # [match_num, max_node_num, emb_dim]
-        y_len = node_num[match_pairs[:, 1]]             # [match_num]
+        x = align_risk_embedding[match_pairs[:, 0]]  # [match_num, max_node_num, emb_dim]
+        x_len = node_num[match_pairs[:, 0]]  # [match_num]
+        y = align_risk_embedding[match_pairs[:, 1]]  # [match_num, max_node_num, emb_dim]
+        y_len = node_num[match_pairs[:, 1]]  # [match_num]
 
-        s = self.affinity(x,y)  # [match_num, max_node_num, max_node_num]
+        s = self.affinity(x, y)  # [match_num, max_node_num, max_node_num]
         s = self.sinkhorn(s, nrows=x_len, ncols=y_len)  # [match_num, max_node_num, max_node_num]
         s = hungarian(s, x_len, y_len)
 
-
         target_node = torch.zeros([1]).to(torch.int64).to(self.device)
-        target_node = torch.cat([target_node, torch.cumsum(node_num, dim=0)[:-1]], dim=0)    # [batch_size]
+        target_node = torch.cat([target_node, torch.cumsum(node_num, dim=0)[:-1]], dim=0)  # [batch_size]
 
-        x = torch.cat(risk_embedding, dim=0)    # [node_num, dim]
+        x = torch.cat(risk_embedding, dim=0)  # [node_num, dim]
         edge_index = [edge - 1 + target_node[i] for i, edge in enumerate(graph_enclosing)]  # [2,]
-        for idx, (i,j) in enumerate(match_pairs):
+        for idx, (i, j) in enumerate(match_pairs):
             fake_edge_index = dense_to_sparse(s[idx])[0]
             fake_edge_index[0] += target_node[i]
             fake_edge_index[1] += target_node[j]
@@ -158,15 +162,12 @@ class UBSR(UBS):
         edge_index = torch.cat(edge_index, dim=-1)
         edge_index = edge_index.unique(dim=-1)
 
-        target_node_emb = self.sage(x, edge_index)[target_node]     # [target_node, dim]
+        target_node_emb = self.sage(x, edge_index)[target_node]  # [target_node, dim]
         input = torch.cat([target_node_emb.repeat_interleave(target_node_emb.shape[0], dim=0),
-                           target_node_emb.repeat(( target_node_emb.shape[0], 1))], dim=-1)  # [b*b,2*h]
+                           target_node_emb.repeat((target_node_emb.shape[0], 1))], dim=-1)  # [b*b,2*h]
         similarity = self.similarity(input).squeeze(-1).reshape(batch_size, batch_size)
         similarity = torch.sigmoid(similarity)
         return target_node_emb, similarity
-
-
-
 
     def get_match_pairs(self, metric_pairs=None, batch_size=0):
         if metric_pairs is not None:
@@ -177,14 +178,14 @@ class UBSR(UBS):
             match_pairs = torch.cat(match_pairs, dim=0).unique(dim=0)
             return match_pairs
 
-        if batch_size!=0:
+        if batch_size != 0:
             points = torch.arange(batch_size)
-            paris = torch.stack([points.repeat_interleave(batch_size, dim=0), points.repeat(batch_size)], dim=1)  # [b*b,2]
+            paris = torch.stack([points.repeat_interleave(batch_size, dim=0), points.repeat(batch_size)],
+                                dim=1)  # [b*b,2]
             match_pairs = paris[paris[:, 0] != paris[:, 1]]  # [b*(b-1),2]
             return match_pairs
 
         raise IOError("Please check input!")
-
 
     def learning_risk_conduction_effect(self, caw_s, caw_t, caw_time, caw_edge_emb, caw_mask_len):
         """
@@ -202,7 +203,7 @@ class UBSR(UBS):
         caw_time = torch.cat(caw_time, dim=0)
         caw_mask_len = torch.cat(caw_mask_len, dim=0)
 
-        # 1. get the feature matrix shaped [batch, n_walk, len_walk + 1, time_dim + pos_dim + edge_dim]
+        # 1. get the feature matrix shaped [batch, n_walk, len_walk + 1, time_encoder_dim + pos_dim + edge_dim]
         time_emb = self.time_encoder(caw_time)
         s_position_emb = self.s_position_encoder(caw_s).sum(dim=-2)
         t_position_emb = self.t_position_encoder(caw_t).sum(dim=-2)
@@ -214,24 +215,24 @@ class UBSR(UBS):
 
         features = features.view(-1, walk_length, feat_dim)
         features = self.feature_layer(features)[0].view(batch_size, walk_num, walk_length, -1)
-        features = features.gather(2, caw_mask_len.expand(batch_size, walk_num, 1, features.shape[-1])).squeeze(2)  # [batch, n_walk, *_dim]
+        features = features.gather(2, caw_mask_len.expand(batch_size, walk_num, 1, features.shape[-1])).squeeze(
+            2)  # [batch, n_walk, *_dim]
 
         position_emb = torch.cat([s_position_emb, t_position_emb], dim=-1)
         position_features = position_emb.view(-1, walk_length, position_emb.shape[-1])
         position_features = self.position_layer(position_features)[0].view(batch_size, walk_num, walk_length, -1)
-        position_features = position_features.gather(2, caw_mask_len.expand(batch_size, walk_num, 1, position_features.shape[-1])).squeeze(2)  # [batch, n_walk, *_dim]
+        position_features = position_features.gather(2, caw_mask_len.expand(batch_size, walk_num, 1,
+                                                                            position_features.shape[-1])).squeeze(
+            2)  # [batch, n_walk, *_dim]
 
         combined_features = torch.cat([features, position_features], dim=-1)
         combined_features = torch.relu(self.projector(combined_features))
 
         # 3. aggregate and collapse dim=1 (using set operation), now shaped [batch, out_dim]
         combined_features = combined_features.mean(1)
-        risk_embedding = self.risk_layer(combined_features) # [batch_size, *_dim]
-        risk_embedding = risk_embedding.split(node_num, 0)     # [batch_size][node_num, _dim]
+        risk_embedding = self.risk_layer(combined_features)  # [batch_size, *_dim]
+        risk_embedding = risk_embedding.split(node_num, 0)  # [batch_size][node_num, _dim]
         return risk_embedding
-
-
-
 
     def training_step(self, data, batch_idx, optimizer_idx=None):
         self.first_validation = False
@@ -239,15 +240,16 @@ class UBSR(UBS):
         data = self.data_merge(data)
         batch_size, query_emb, support_emb_after_group, support_type_after_group, behavior_seq_emb, \
         behavior_seq_type, behavior_seq_time, behavior_seq_len, query_time, settle_time, gt, \
-        caw_s, caw_t, caw_time, caw_edge_emb, caw_mask_len, caw_edge_index =  self.data_prepare(data, is_test=False)
+        caw_s, caw_t, caw_time, caw_edge_emb, caw_mask_len, caw_edge_index = self.data_prepare(data, is_test=False)
 
-        default_prob, mus, logvars, delta_logps, loglike_tp,  metric_pairs, distance, beta = \
+        default_prob, mus, logvars, delta_logps, like_tp, metric_pairs, distance, beta = \
             self.forward(batch_size, query_emb, support_emb_after_group, support_type_after_group,
                          behavior_seq_emb, behavior_seq_type, behavior_seq_time, behavior_seq_len, query_time,
                          settle_time, caw_s, caw_t, caw_time, caw_edge_emb, caw_mask_len, caw_edge_index,
                          is_test=False, gt=gt)
 
-        loss = self.calculate_loss(mus, logvars, delta_logps, loglike_tp, metric_pairs, distance, beta, default_prob, gt)
+        loss = self.calculate_loss(mus, logvars, delta_logps, like_tp, metric_pairs, distance, beta, default_prob,
+                                   gt, query_time, settle_time)
         self.log('train_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=len(gt))
         return loss
 
@@ -257,7 +259,7 @@ class UBSR(UBS):
             default_prob = torch.rand(gt.shape)
         else:
             batch_size, query_emb, support_emb_after_group, support_type_after_group, behavior_seq_emb, \
-            behavior_seq_type, behavior_seq_time, behavior_seq_len, query_time, settle_time, gt,\
+            behavior_seq_type, behavior_seq_time, behavior_seq_len, query_time, settle_time, gt, \
             caw_s, caw_t, caw_time, caw_edge_emb, caw_mask_len, caw_edge_index = self.data_prepare(data, is_test=True)
 
             default_prob = self.forward(batch_size, query_emb, support_emb_after_group, support_type_after_group,
@@ -269,7 +271,7 @@ class UBSR(UBS):
 
     def test_step(self, data, batch_idx):
         batch_size, query_emb, support_emb_after_group, support_type_after_group, behavior_seq_emb, \
-        behavior_seq_type, behavior_seq_time, behavior_seq_len, query_time, settle_time, gt,\
+        behavior_seq_type, behavior_seq_time, behavior_seq_len, query_time, settle_time, gt, \
         caw_s, caw_t, caw_time, caw_edge_emb, caw_mask_len, caw_edge_index = self.data_prepare(data, is_test=True)
 
         default_prob = self.forward(batch_size, query_emb, support_emb_after_group, support_type_after_group,
@@ -280,9 +282,8 @@ class UBSR(UBS):
         p = self.formulate_for_metric(default_prob)
         self.update_metric("test", gt, p, p_prob=default_prob)
 
-
     def data_prepare(self, data, is_test):
-        batch_size, query_emb, support_emb_after_group, support_type_after_group, behavior_seq_emb,  behavior_seq_type, \
+        batch_size, query_emb, support_emb_after_group, support_type_after_group, behavior_seq_emb, behavior_seq_type, \
         behavior_seq_time, behavior_seq_len, query_time, settle_time, gt = super(UBSR, self).data_prepare(data, is_test)
 
         caw_s, caw_t, caw_time, caw_edge_emb, caw_mask_len, caw_edge_index = data[0]['caw_s'], \
@@ -297,21 +298,20 @@ class UBSR(UBS):
                caw_s, caw_t, caw_time, caw_edge_emb, caw_mask_len, caw_edge_index
 
 
-
 class TimeEncode(torch.nn.Module):
     def __init__(self, expand_dim, factor=5):
         super(TimeEncode, self).__init__()
-        self.time_dim = expand_dim
+        self.time_encoder_dim = expand_dim
         self.factor = factor
-        self.basis_freq = torch.nn.Parameter((torch.from_numpy(1 / 10 ** np.linspace(0, 9, self.time_dim))).float())
-        self.phase = torch.nn.Parameter(torch.zeros(self.time_dim).float())
+        self.basis_freq = torch.nn.Parameter(
+            (torch.from_numpy(1 / 10 ** np.linspace(0, 9, self.time_encoder_dim))).float())
+        self.phase = torch.nn.Parameter(torch.zeros(self.time_encoder_dim).float())
 
-
-    def forward(self, time):    # [batch_size, walk_num, walk_length]
+    def forward(self, time):  # [batch_size, walk_num, walk_length]
         batch_size, walk_num, walk_length = time.shape
 
         time = time.view(batch_size, -1).unsqueeze(-1)  # [batch_size, walk_num * walk_length, 1]
-        map_time = time * self.basis_freq.view(1, 1, -1)  # [batch_size, walk_num * walk_length, time_dim]
+        map_time = time * self.basis_freq.view(1, 1, -1)  # [batch_size, walk_num * walk_length, time_encoder_dim]
         map_time += self.phase.view(1, 1, -1)
 
         harmonic = torch.cos(map_time)
@@ -327,6 +327,7 @@ class Affinity(nn.Module):
     Input: feature X, Y
     Output: affinity matrix M
     """
+
     def __init__(self, d):
         super(Affinity, self).__init__()
         self.d = d
@@ -343,9 +344,9 @@ class Affinity(nn.Module):
         input: [batch_size, node_num, node_num]
         """
         assert X.shape[2] == Y.shape[2] == self.d
-        M = torch.matmul(X, self.A) # [b,n,d] x [d, d] -> [b,n,d]
-        M = torch.matmul(M, Y.transpose(1, 2)) # [b,n,d] x [b,d,m] -> [b,n,m]
-        return M    # [batch_size, node_num1, node_num2]
+        M = torch.matmul(X, self.A)  # [b,n,d] x [d, d] -> [b,n,d]
+        M = torch.matmul(M, Y.transpose(1, 2))  # [b,n,d] x [b,d,m] -> [b,n,m]
+        return M  # [batch_size, node_num1, node_num2]
 
 
 class Sinkhorn(nn.Module):
@@ -378,14 +379,15 @@ class Sinkhorn(nn.Module):
         Setting ``batched_operation=True`` may be preferred when you are doing inference with this module and do not
         need the gradient.
     """
-    def __init__(self, max_iter: int=10, tau: float=1., epsilon: float=1e-4,
-                 log_forward: bool=True, batched_operation: bool=False):
+
+    def __init__(self, max_iter: int = 10, tau: float = 1., epsilon: float = 1e-4,
+                 log_forward: bool = True, batched_operation: bool = False):
         super(Sinkhorn, self).__init__()
         self.max_iter = max_iter
         self.tau = tau
         self.epsilon = epsilon
-        self.batched_operation = batched_operation # batched operation may cause instability in backward computation,
-                                                   # but will boost computation.
+        self.batched_operation = batched_operation  # batched operation may cause instability in backward computation,
+        # but will boost computation.
 
     def forward(self, s: torch.Tensor, nrows=None, ncols=None, dummy_row=False) -> torch.Tensor:
         """
@@ -410,7 +412,6 @@ class Sinkhorn(nn.Module):
             matrix_input = False
         else:
             raise ValueError('input data shape not understood.')
-
 
         batch_size = s.shape[0]
 
@@ -504,10 +505,7 @@ class Sinkhorn(nn.Module):
         #    log_s = s[b, row_slice, col_slice]
 
 
-
-
-
-def hungarian(s: torch.Tensor, n1=None, n2=None, nproc: int=1):
+def hungarian(s: torch.Tensor, n1=None, n2=None, nproc: int = 1):
     r"""
     Solve optimal LAP permutation by hungarian algorithm. The time cost is :math:`O(n^3)`.
     :param s: :math:`(b\times n_1 \times n_2)` input 3d tensor. :math:`b`: batch size

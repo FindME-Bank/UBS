@@ -1,9 +1,9 @@
 {
   "server": {
-    "your server id": {
-      "data_path": "your dataset's path",
-      "moel_path": "the save path of your model",
-      "result_path": "the save path of your result"
+    "local": {
+      "data_path": "../dataset/",
+      "model_path": "../exp_result/model/",
+      "result_path": "../exp_result/result/"
     }
   }
 }

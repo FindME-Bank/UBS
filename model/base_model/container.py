@@ -1,6 +1,6 @@
 import torch
 import pytorch_lightning as pl
-from torchmetrics import Accuracy, F1, Recall, Precision, AUROC, PrecisionRecallCurve, AUC
+from torchmetrics import AUROC, PrecisionRecallCurve, AUC
 
 __all__ = ["Container", "FraudContainer"]
 
@@ -44,7 +44,7 @@ class Container(pl.LightningModule):
                 print("epoch:{}: metric_{}_{}:{}: comment: {}".format(current_epoch, mode, name, value.compute(),
                                                                       comment))
 
-    def update_metric(self, mode, t, p, metric_list=None, **kwargs):
+    def update_metric(self, mode, t, p, metric_list=None, p_prob=None, **kwargs):
         """
         Args:
             mode: "train"/"val"/"test"
@@ -73,31 +73,43 @@ class Container(pl.LightningModule):
         raise NotImplementedError
 
     def on_train_epoch_end(self, metric_list=None) -> None:
+        super(Container, self).on_train_epoch_end()
         if "train" in self.metric_mode:
             if metric_list is None: metric_list = self.default_metric_names
             current_metric_dict = {metric: self.train_metric_dict[metric] for metric in
                                    metric_list} if metric_list else self.train_metric_dict
             self.print_log("train", self.current_epoch, current_metric_dict, comment=self.comment)
 
+            for key in self.train_metric_dict.keys():
+                self.train_metric_dict[key].reset()
+
     def validation_step(self, data, batch_idx):
         raise NotImplementedError
 
     def on_validation_epoch_end(self) -> None:
+        super(Container, self).on_validation_epoch_end()
         if "val" in self.metric_mode:
             metric_list = self.default_metric_names
             current_metric_dict = {metric: self.val_metric_dict[metric] for metric in
                                    metric_list} if metric_list else self.val_metric_dict
             self.print_log("val", self.current_epoch, current_metric_dict, comment=self.comment)
 
+            for key in self.val_metric_dict.keys():
+                self.val_metric_dict[key].reset()
+
     def test_step(self, data, batch_idx):
         raise NotImplementedError
 
     def on_test_epoch_end(self) -> None:
+        super(Container, self).on_test_epoch_end()
         if "test" in self.metric_mode:
             metric_list = self.default_metric_names
             current_metric_dict = {metric: self.test_metric_dict[metric] for metric in
                                    metric_list} if metric_list else self.test_metric_dict
             self.print_log("test", self.current_epoch, current_metric_dict, comment=self.comment)
+
+            for key in self.test_metric_dict.keys():
+                self.test_metric_dict[key].reset()
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
