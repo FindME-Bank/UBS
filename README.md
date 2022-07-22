@@ -16,7 +16,7 @@ This repository contains an implementation of our "Beyond Detection: When, How a
 
 ### data
 
-We provide paysim demo dataset
+We provide paysim demo dataset in file dataset.zip, which contains:
 
 `data_ubs.pt` is the data for user behavior sequence.
 
