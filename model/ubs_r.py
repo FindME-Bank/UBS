@@ -46,9 +46,9 @@ class UBSR(UBS):
         self.risk_layer = nn.Linear(conduction_hidden_dim, risk_embed_dim)
 
         # default_event_prediction_module
-        self.predictor = MLP(self.influence_embed_dim + self.query_feature_dim + risk_embed_dim,
+        self.predictor = MLP(self.query_embedding_dim + self.influence_embed_dim +  1 + risk_embed_dim,
                              [self.predictor_hidden_dim, 1], activation="relu", last_activation=None)
-        self.distance = MLP(2 * (self.influence_embed_dim + self.query_feature_dim + risk_embed_dim),
+        self.distance = MLP(2 * (self.query_embedding_dim + self.influence_embed_dim +  1 + risk_embed_dim),
                             [self.distance_hidden_dim, 1], activation="relu", last_activation=None)
 
         # match_module
@@ -92,17 +92,16 @@ class UBSR(UBS):
         behavior_seq_representations = self.get_behavior_seq_representations(batch_size, behavior_seq_emb,
                                                                              behavior_seq_type, behavior_seq_time,
                                                                              event_type_representations)
-        cumulated_influence = self.model_cumulated_influence(batch_size, behavior_seq_representations,
+        cumulated_influence, h = self.model_cumulated_influence(batch_size, behavior_seq_representations,
                                                              behavior_seq_time, behavior_seq_len, query_time)
-        repayment_willingness, like_tp = self.predict_time(cumulated_influence, query_time, settle_time, is_test)
+        repayment_willingness, like_tp = self.predict_time(h, query_time, settle_time, is_test)
 
         risk_embedding = self.learning_risk_conduction_effect(caw_s, caw_t, caw_time, caw_edge_emb, caw_mask_len)
 
         match_pairs = self.get_match_pairs(batch_size=batch_size)
         target_risk_embedding, walk_distance = self.match(match_pairs, risk_embedding, caw_edge_index)
         query_emb = self.query_embedding_net(query_emb)
-        default_prob = self.predict_default(cumulated_influence, repayment_willingness, query_emb,
-                                            target_risk_embedding)
+        default_prob = self.predict_default(h, repayment_willingness, query_emb, target_risk_embedding)
 
         if is_test:
             return default_prob
@@ -113,7 +112,7 @@ class UBSR(UBS):
                    metric_pairs, distance, beta
 
     def calculate_distance(self, h, willingness, query_emb, target_risk_embedding):
-        input = torch.cat([h, query_emb, target_risk_embedding], dim=-1)
+        input = torch.cat([query_emb, h, willingness.unsqueeze(-1), target_risk_embedding], dim=-1)
         input = torch.cat([input.repeat_interleave(input.shape[0], dim=0), input.repeat((input.shape[0], 1))],
                           dim=-1)  # [b*b,2*h]
         distance = self.distance(input).squeeze(-1).reshape(h.shape[0], h.shape[0])
@@ -121,7 +120,7 @@ class UBSR(UBS):
         return distance
 
     def predict_default(self, h, willingness, query_emb, target_risk_embedding):
-        input = torch.cat([h, query_emb, target_risk_embedding], dim=-1)
+        input = torch.cat([query_emb, h, willingness.unsqueeze(-1), target_risk_embedding], dim=-1)
         default_prob = self.predictor(input).squeeze(-1)
         return torch.sigmoid(default_prob)
 

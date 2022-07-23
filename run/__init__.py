@@ -62,7 +62,7 @@ parser.add_argument('--type_num', dest='type_num', type=int, help='total num of 
 
 # ETM
 parser.add_argument('--type_embed_dim', dest='type_embed_dim', type=int, help='type_embed_dim in ETM module',
-                    default=4)
+                    default=2)
 parser.add_argument('--cnf_hidden_dim', dest='cnf_hidden_dim', type=int, help='type_embed_dim in ATAE module',
                     default=32)
 parser.add_argument('--flow_layer_num', dest='flow_layer_num', type=int, help='flow_layer_num in ATAE module',
@@ -70,7 +70,7 @@ parser.add_argument('--flow_layer_num', dest='flow_layer_num', type=int, help='f
 
 # ode-rnn
 parser.add_argument('--influence_embed_dim', dest='influence_embed_dim', type=int, help='influence embed after ode_rnn',
-                    default=16)
+                    default=4)
 parser.add_argument('--time_normalize', dest='time_normalize', type=int, help='a normalizing process for time to (0,1)',
                     default=743)
 parser.add_argument('--ode_layer_num', dest='ode_layer_num', type=int, help='ode_layer_num in ATAE module', default=2)
@@ -81,13 +81,13 @@ parser.add_argument('--query_embedding_dim', dest='query_embedding_dim', type=in
 
 # predictor
 parser.add_argument('--predictor_hidden_dim', dest='predictor_hidden_dim', type=int, help='hidden dim in predictor',
-                    default=32)
+                    default=64)
 
 # tpm
 parser.add_argument('--sample_num', dest='sample_num', type=int, help='parameter in TP module', default=100)
 
 # hdt
-parser.add_argument('--distance_hidden_dim', dest='distance_hidden_dim', type=int, help='hidden_dim in tpm', default=64)
+parser.add_argument('--distance_hidden_dim', dest='distance_hidden_dim', type=int, help='hidden_dim in tpm', default=128)
 parser.add_argument('--beta', dest='beta', type=float, help='parameter of metric learning for ubs', default=-1)
 parser.add_argument('--max_seq_len', dest='max_seq_len', type=int, help='max_seq_len', default=15)
 

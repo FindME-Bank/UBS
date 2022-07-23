@@ -79,6 +79,8 @@ class UBS(FraudContainer):
         self.influence_embed_dim = influence_embed_dim
         self.predictor_hidden_dim = predictor_hidden_dim
         self.distance_hidden_dim = distance_hidden_dim
+        self.query_embedding_dim = query_embedding_dim
+
 
         # ablation
         self.etm = etm
@@ -116,9 +118,9 @@ class UBS(FraudContainer):
         self.query_embedding_net = MLP(query_feature_dim, [query_embedding_dim])
 
         # default_event_prediction_module
-        self.predictor = MLP(influence_embed_dim + influence_embed_dim + 1, [predictor_hidden_dim, 1], activation="relu", last_activation=None)
+        self.predictor = MLP(query_embedding_dim + influence_embed_dim + 1, [predictor_hidden_dim, 1], activation="relu", last_activation=None)
 
-        self.distance = MLP(2 * (influence_embed_dim + influence_embed_dim + 1), [distance_hidden_dim, 1], activation="relu",
+        self.distance = MLP(2 * (query_embedding_dim + influence_embed_dim + 1), [distance_hidden_dim, 1], activation="relu",
                             last_activation=None)
 
         self.first_validation = True
